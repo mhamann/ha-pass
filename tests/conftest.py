@@ -21,6 +21,10 @@ from app import database as db
 from app.config import settings
 from app.models import NEVER_EXPIRES_SECONDS
 
+# Home location reported by the mocked HA /api/config
+HOME_LAT = 40.0
+HOME_LON = -75.0
+
 
 @pytest_asyncio.fixture
 async def test_db(tmp_path):
@@ -63,6 +67,8 @@ def mock_ha_client():
         "close_client": AsyncMock(),
         "is_ws_healthy": MagicMock(return_value=True),
         "get_states": AsyncMock(return_value=[]),
+        "get_state": AsyncMock(return_value=None),
+        "get_config": AsyncMock(return_value={"latitude": HOME_LAT, "longitude": HOME_LON}),
         "call_service": AsyncMock(return_value=[]),
         "fire_event": AsyncMock(return_value={}),
         "logbook_log": AsyncMock(return_value={}),
@@ -121,3 +127,42 @@ async def sample_token(test_db):
         ip_allowlist=None,
     )
     return token
+
+
+@pytest.fixture(autouse=True)
+def _reset_proximity_cache():
+    """Proximity caches HA-derived inputs at module level; isolate tests."""
+    from app import proximity
+    proximity.reset_cache()
+    yield
+    proximity.reset_cache()
+
+
+@pytest.fixture
+def override_settings():
+    """Temporarily set attributes on the global settings object."""
+    saved: dict = {}
+
+    def _set(**kwargs):
+        for k, v in kwargs.items():
+            if k not in saved:
+                saved[k] = getattr(settings, k)
+            setattr(settings, k, v)
+
+    yield _set
+    for k, v in saved.items():
+        setattr(settings, k, v)
+
+
+@pytest_asyncio.fixture
+async def prox_token(test_db):
+    """A proximity-gated token (150 m, home network allowed)."""
+    now = int(time.time())
+    return await db.create_token(
+        label="Garage Guest",
+        slug="garage-guest",
+        entity_ids=["cover.garage_door"],
+        expires_at=now + 3600,
+        ip_allowlist=None,
+        proximity={"proximity_required": True, "geofence_radius_m": 150, "allow_home_network": True},
+    )

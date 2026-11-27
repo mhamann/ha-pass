@@ -95,6 +95,7 @@ async def create_token(
     entity_ids: list[str],
     expires_at: int,
     ip_allowlist: list[str] | None,
+    proximity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     db = await get_db()
     token_id = str(uuid.uuid4())
@@ -108,9 +109,10 @@ async def create_token(
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
             """INSERT INTO tokens
-               (id, slug, label, created_at, expires_at, ip_allowlist)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (token_id, slug, label, now, expires_at, ip_json),
+               (id, slug, label, created_at, expires_at, ip_allowlist,
+                proximity_required, geofence_radius_m, allow_home_network)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (token_id, slug, label, now, expires_at, ip_json, *_proximity_values(proximity)),
         )
         if entity_ids:
             await db.executemany(
@@ -122,6 +124,33 @@ async def create_token(
         await db.execute("ROLLBACK")
         raise
     return await get_token_by_id(token_id)  # type: ignore[return-value]
+
+
+PROXIMITY_DEFAULTS: dict[str, Any] = {
+    "proximity_required": False,
+    "geofence_radius_m": 150,
+    "allow_home_network": True,
+}
+
+
+def _proximity_values(proximity: dict[str, Any] | None) -> tuple[int, int, int]:
+    p = {**PROXIMITY_DEFAULTS, **(proximity or {})}
+    return (
+        int(bool(p["proximity_required"])),
+        int(p["geofence_radius_m"]),
+        int(bool(p["allow_home_network"])),
+    )
+
+
+async def update_token_proximity(token_id: str, proximity: dict[str, Any]) -> None:
+    db = await get_db()
+    await db.execute(
+        """UPDATE tokens SET proximity_required = ?, geofence_radius_m = ?,
+                  allow_home_network = ?
+           WHERE id = ?""",
+        (*_proximity_values(proximity), token_id),
+    )
+    await db.commit()
 
 
 async def get_token_by_slug(slug: str) -> aiosqlite.Row | None:
@@ -224,13 +253,17 @@ async def log_access(
     user_agent: str | None = None,
     entity_id: str | None = None,
     service: str | None = None,
+    proximity_method: str | None = None,
+    distance_m: int | None = None,
 ) -> None:
     db = await get_db()
     await db.execute(
         """INSERT INTO access_log
-           (token_id, timestamp, event_type, entity_id, service, ip_address, user_agent)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (token_id, int(time.time()), event_type, entity_id, service, ip_address, user_agent),
+           (token_id, timestamp, event_type, entity_id, service, ip_address, user_agent,
+            proximity_method, distance_m)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (token_id, int(time.time()), event_type, entity_id, service, ip_address, user_agent,
+         proximity_method, distance_m),
     )
     # Single-write commit is acceptable at homelab scale; batch for high throughput
     await db.commit()
@@ -240,7 +273,8 @@ async def list_access_logs(limit: int = 50) -> list[aiosqlite.Row]:
     db = await get_db()
     async with db.execute(
         """SELECT al.timestamp, al.event_type, al.entity_id, al.service,
-                  al.ip_address, t.label AS token_label
+                  al.ip_address, al.proximity_method, al.distance_m,
+                  t.label AS token_label
            FROM access_log al
            LEFT JOIN tokens t ON t.id = al.token_id
            ORDER BY al.timestamp DESC, al.id DESC

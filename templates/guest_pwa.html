@@ -128,6 +128,12 @@
       </div>
       <span id="expiry-timer" class="text-xs font-bold font-mono text-muted tabular-nums"></span>
     </div>
+    {% if proximity_required %}
+    <div id="proximity-note" class="mt-2 flex items-center gap-1.5 text-[11px] text-muted">
+      <span aria-hidden="true" class="material-symbols-outlined text-sm">location_on</span>
+      <span>Works only at the house. You may be asked to share your location.</span>
+    </div>
+    {% endif %}
   </div>
 </header>
 
@@ -190,6 +196,7 @@ requestAnimationFrame(updateThemeToggles);
 const SLUG = {{ slug | tojson }};
 const EXPIRES_AT = {{ expires_at | tojson }};
 const NEVER_EXPIRES = {{ never_expires }};
+const PROXIMITY_REQUIRED = {{ proximity_required | tojson }};
 let states = {};
 let entityOrder = [];
 let sheetCallback = null;
@@ -251,8 +258,10 @@ let expiryInterval = setInterval(() => {
 
 // ── Init ─────────────────────────────────────────────────────────────
 async function init() {
+  if (PROXIMITY_REQUIRED && !(await ensurePresence())) return;
   try {
     const r = await fetch(`/g/${SLUG}/state`);
+    if (r.status === 403 && PROXIMITY_REQUIRED) { presenceLost(); return; }
     if (r.status === 410) { showExpired(); return; }
     if (!r.ok) throw new Error('Failed to load');
     const data = await r.json();
@@ -300,7 +309,21 @@ function connectSSE() {
     showExpired();
   });
 
+  // Presence grant lapsed server-side: re-check location, then reconnect.
+  eventSource.addEventListener('proximity_expired', () => {
+    eventSource.close();
+    eventSource = null;
+    presenceLost();
+  });
+
   eventSource.onerror = () => {
+    // A non-200 response (e.g. 403 not near home) closes the EventSource for
+    // good; plain network drops leave it CONNECTING and it retries itself.
+    if (PROXIMITY_REQUIRED && eventSource && eventSource.readyState === EventSource.CLOSED) {
+      eventSource = null;
+      presenceLost();
+      return;
+    }
     badge.className = 'inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider bg-primary/10 text-primary';
     dot.className = 'w-1.5 h-1.5 rounded-full bg-current';
     text.textContent = 'Offline';
@@ -314,6 +337,7 @@ async function refetchState() {
   try {
     const r = await fetch(`/g/${SLUG}/state`);
     if (r.status === 410) { showExpired(); return; }
+    if (r.status === 403 && PROXIMITY_REQUIRED) { presenceLost(); return; }
     if (!r.ok) return;
     const data = await r.json();
     states = data.states;
@@ -810,13 +834,178 @@ function showToast(msg, type = 'error') {
   setTimeout(() => { el.classList.add('toast-out'); setTimeout(() => el.remove(), 200); }, 3000);
 }
 
-async function sendCmd(entityId, domain, service, extraData = {}) {
+// ── Proximity ("near home") ──────────────────────────────────────────
+// Commands are first sent without a location: if the guest is on the home
+// network the server accepts them as-is. Only when the server asks for a
+// location do we prompt for GPS — and from then on we send it up front.
+let locationNeeded = false;
+
+function getLocation() {
+  return new Promise((resolve, reject) => {
+    if (!('geolocation' in navigator)) { reject({ code: -1 }); return; }
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lon: p.coords.longitude,
+                     accuracy: p.coords.accuracy, ts: Math.round(p.timestamp) }),
+      err => reject(err),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 },
+    );
+  });
+}
+
+// Viewing: POST /presence (no location first — home Wi-Fi passes on IP alone;
+// GPS only if the server asks). Success sets a short-lived HttpOnly cookie
+// that unlocks /state and /stream; we renew it shortly before it lapses.
+let presenceTimer = null;
+let presenceChecking = null;
+
+async function postPresence(location) {
+  return fetch(`/g/${SLUG}/presence`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(location ? { location } : {}),
+  });
+}
+
+function ensurePresence() {
+  if (!presenceChecking) presenceChecking = doPresenceCheck().finally(() => { presenceChecking = null; });
+  return presenceChecking;
+}
+
+async function doPresenceCheck() {
+  clearTimeout(presenceTimer);
   try {
-    const r = await fetch(`/g/${SLUG}/command`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ entity_id: entityId, service: `${domain}.${service}`, data: extraData }),
-    });
+    let r = locationNeeded ? null : await postPresence(null);
+    if (r && r.status === 410) { showExpired(); return false; }
+    let detail = r && r.status === 403 ? ((await r.json().catch(() => ({}))).detail || {}) : null;
+    if (!r || (detail && detail.reason === 'location_required')) {
+      locationNeeded = true;
+      showPresenceScreen('locating');
+      let loc;
+      try { loc = await getLocation(); }
+      catch (err) { showPresenceScreen('error', locationErrorMessage(err)); return false; }
+      r = await postPresence(loc);
+      if (r.status === 410) { showExpired(); return false; }
+      detail = r.status === 403 ? ((await r.json().catch(() => ({}))).detail || {}) : null;
+    }
+    if (detail) { showPresenceScreen('error', proximityDeniedMessage(detail)); return false; }
+    if (!r.ok) { showPresenceScreen('error', 'Couldn’t verify your location — try again'); return false; }
+    const data = await r.json();
+    if (data.method === 'network') locationNeeded = false;
+    const renewIn = Math.max(30, (data.expires_in || 600) - 60) * 1000;
+    presenceTimer = setTimeout(renewPresence, renewIn);
+    return true;
+  } catch {
+    showPresenceScreen('error', 'You appear to be offline');
+    return false;
+  }
+}
+
+// Background renewal while the page is open. Hidden tabs skip it; the stream
+// then lapses and presenceLost() runs when the guest comes back.
+async function renewPresence() {
+  if (document.visibilityState !== 'visible') return;
+  if (!(await ensurePresence())) {
+    if (eventSource) { eventSource.close(); eventSource = null; }
+  }
+}
+
+async function presenceLost() {
+  if (await ensurePresence()) {
+    await refetchState();
+    if (!eventSource) connectSSE();
+  }
+}
+
+function showPresenceScreen(mode, message) {
+  if (mode === 'error') { states = {}; }
+  const container = document.getElementById('cards-container');
+  container.innerHTML = mode === 'locating'
+    ? `<div class="flex flex-col items-center justify-center py-16 text-muted text-center">
+         <div class="w-6 h-6 border-2 border-border-light dark:border-border-dark border-t-accent rounded-full spinner mb-3"></div>
+         <span class="text-sm">Checking that you’re at the house…</span>
+       </div>`
+    : `<div class="flex flex-col items-center justify-center py-16 text-center gap-3">
+         <div class="w-16 h-16 rounded-full bg-soot/5 dark:bg-white/5 flex items-center justify-center">
+           <span aria-hidden="true" class="material-symbols-outlined text-3xl text-muted">location_off</span>
+         </div>
+         <p class="text-sm max-w-xs">${esc(message || 'You need to be at the house to use this link')}</p>
+         <button data-action="retry-presence" class="mt-1 px-4 py-2 rounded-xl bg-primary text-white text-sm font-display font-semibold">Try again</button>
+       </div>`;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (PROXIMITY_REQUIRED && document.visibilityState === 'visible' && !eventSource && !presenceChecking) {
+    presenceLost();
+  }
+});
+
+function formatDistance(m) {
+  const imperial = /^en-(US|LR|MM)\b/.test(navigator.language || '');
+  if (imperial) {
+    const ft = m * 3.28084;
+    return ft < 1000 ? `${Math.round(ft / 10) * 10} ft` : `${(m / 1609.344).toFixed(1)} mi`;
+  }
+  return m < 1000 ? `${Math.round(m / 10) * 10} m` : `${(m / 1000).toFixed(1)} km`;
+}
+
+function locationErrorMessage(err) {
+  if (err && err.code === 1) return 'Allow location access to use this link';
+  if (err && err.code === -1) return 'This browser can’t share its location';
+  return 'Couldn’t get your location — try again';
+}
+
+function proximityDeniedMessage(detail) {
+  switch (detail && detail.reason) {
+    case 'too_far':
+      return `You need to be at the house (you’re ${formatDistance(detail.distance_m)} away)`;
+    case 'presence_required':
+      return 'Please confirm you’re at the house';
+    case 'location_inaccurate':
+      return 'Your location is too imprecise — enable precise location and try again';
+    case 'location_stale':
+      return 'Your location was out of date — try again';
+    case 'home_location_unavailable':
+      return 'Location check is unavailable right now';
+    default:
+      return 'You need to be at the house to do this';
+  }
+}
+
+async function postCmd(payload) {
+  return fetch(`/g/${SLUG}/command`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+}
+
+async function sendCmd(entityId, domain, service, extraData = {}) {
+  const payload = { entity_id: entityId, service: `${domain}.${service}`, data: extraData };
+  try {
+    let r;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (PROXIMITY_REQUIRED && locationNeeded) {
+        try {
+          payload.location = await getLocation();
+        } catch (err) {
+          showToast(locationErrorMessage(err));
+          refetchState();
+          return;
+        }
+      }
+      r = await postCmd(payload);
+      if (r.status !== 403 || !PROXIMITY_REQUIRED) break;
+      const body = await r.clone().json().catch(() => ({}));
+      const detail = body && body.detail;
+      if (!detail || detail.error !== 'not_near_home') break;
+      if (detail.reason === 'location_required' && !locationNeeded) {
+        locationNeeded = true;   // retry once, this time with GPS
+        continue;
+      }
+      showToast(proximityDeniedMessage(detail));
+      refetchState();            // undo optimistic UI updates
+      return;
+    }
     if (r.status === 410) { showExpired(); return; }
     if (r.status === 429) { showToast('Too many requests — slow down'); return; }
     if (!r.ok) showToast('Command failed');
@@ -915,6 +1104,9 @@ document.addEventListener('click', e => {
       break;
     case 'cover-cmd':
       sendCmd(eid, 'cover', el.dataset.service);
+      break;
+    case 'retry-presence':
+      presenceLost();
       break;
     case 'close-sheet':
       closeSheet();

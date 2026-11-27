@@ -1,19 +1,24 @@
 """Admin API router."""
 import ipaddress
 import json
+import logging
 import secrets
 import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
 
 from app import database as db
 from app.auth import INGRESS_SENTINEL, SESSION_COOKIE, require_admin, verify_password
+from app.client_ip import client_ip, request_is_https
 from app.config import settings
 from app import ha_client
+from app import ha_auth
 from app.models import (
     AdminLoginRequest,
     NEVER_EXPIRES_SECONDS,
+    ProximitySettings,
     SUPPORTED_DOMAINS,
     TokenCreateRequest,
     TokenUpdateEntitiesRequest,
@@ -22,9 +27,13 @@ from app.models import (
 from app.rate_limiter import RateLimiter
 
 router = APIRouter(prefix="/admin")
+logger = logging.getLogger(__name__)
 
 # Admin session lifetime — 24 hours, hardcoded like Uptime Kuma / Dockge.
 ADMIN_SESSION_TTL = 86400
+# Sessions created via Home Assistant sign-in are shorter: re-auth is one click.
+HA_ADMIN_SESSION_TTL = 12 * 3600
+OAUTH_STATE_TTL = ha_auth.STATE_TTL_S
 
 # CSRF: Admin routes are protected by SameSite=strict cookie. The slug-based
 # guest auth acts as a bearer token — no additional CSRF token needed.
@@ -38,36 +47,103 @@ _login_limiter = RateLimiter()
 
 @router.post("/login")
 async def login(body: AdminLoginRequest, request: Request, response: Response) -> dict:
-    if not settings.admin_password:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Login disabled — use HA sidebar")
+    if not settings.password_login_enabled:
+        detail = "Password login disabled — sign in with Home Assistant" if settings.ha_login_enabled \
+            else "Login disabled — use HA sidebar"
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
     # Rate limit login attempts by IP
-    client_ip = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or (request.client.host if request.client else "unknown")
-    )
-    allowed = await _login_limiter.check(f"login:{client_ip}", 5)
+    allowed = await _login_limiter.check(f"login:{client_ip(request)}", 5)
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many login attempts")
 
     if body.username != settings.admin_username or not await verify_password(body.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
-    is_https = (
-        request.url.scheme == "https"
-        or forwarded_proto == "https"
-    )
     session_id = await db.create_admin_session(ttl_seconds=ADMIN_SESSION_TTL)
+    _set_session_cookie(response, request, session_id, ADMIN_SESSION_TTL)
+    return {"ok": True}
+
+
+def _set_session_cookie(response: Response, request: Request, session_id: str, ttl: int) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         session_id,
         httponly=True,
         samesite="strict",
-        secure=is_https,
-        max_age=ADMIN_SESSION_TTL,
+        secure=request_is_https(request),
+        max_age=ttl,
     )
-    return {"ok": True}
+
+
+def _login_error_redirect(request: Request, code: str) -> RedirectResponse:
+    resp = RedirectResponse(
+        url=f"{request.state.ingress_path}/admin/dashboard?login_error={code}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+    resp.delete_cookie(ha_auth.STATE_COOKIE, path="/admin/auth")
+    return resp
+
+
+@router.get("/auth/ha/start")
+async def ha_login_start(request: Request):
+    if not settings.ha_login_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    state, url = ha_auth.begin_login()
+    resp = RedirectResponse(url=url, status_code=status.HTTP_303_SEE_OTHER)
+    # Lax (not Strict): it must survive the top-level redirect back from HA,
+    # which may live on a different site.
+    resp.set_cookie(
+        ha_auth.STATE_COOKIE,
+        state,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_https(request),
+        max_age=OAUTH_STATE_TTL,
+        path="/admin/auth",
+    )
+    return resp
+
+
+@router.get("/auth/ha/callback")
+async def ha_login_callback(
+    request: Request,
+    code: str | None = Query(default=None, max_length=512),
+    state: str | None = Query(default=None, max_length=256),
+    error: str | None = Query(default=None, max_length=128),
+):
+    if not settings.ha_login_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if not await _login_limiter.check(f"ha-login:{client_ip(request)}", 10):
+        return _login_error_redirect(request, "rate_limited")
+    if error:
+        if state:
+            ha_auth.take_verifier(state)
+        return _login_error_redirect(request, "cancelled")
+    expected = request.cookies.get(ha_auth.STATE_COOKIE)
+    if not code or not state or not expected or not secrets.compare_digest(state, expected):
+        return _login_error_redirect(request, "bad_state")
+    verifier = ha_auth.take_verifier(state)
+    if verifier is None:  # expired, already used, or app restarted mid-login
+        return _login_error_redirect(request, "bad_state")
+    try:
+        user = await ha_auth.login_with_code(code, verifier)
+    except ha_auth.HAAuthError as exc:
+        logger.warning("HA admin login rejected: %s (%s)", exc.code, exc)
+        return _login_error_redirect(request, exc.code)
+    except Exception:
+        logger.exception("HA admin login failed")
+        return _login_error_redirect(request, "ha_error")
+
+    logger.info("Admin signed in via Home Assistant: %s (%s)", user.name, user.id)
+    session_id = await db.create_admin_session(ttl_seconds=HA_ADMIN_SESSION_TTL)
+    resp = RedirectResponse(
+        url=f"{request.state.ingress_path}/admin/dashboard",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+    resp.delete_cookie(ha_auth.STATE_COOKIE, path="/admin/auth")
+    _set_session_cookie(resp, request, session_id, HA_ADMIN_SESSION_TTL)
+    return resp
 
 
 @router.post("/logout")
@@ -101,6 +177,11 @@ def _row_to_response(row: Any, entity_ids: list[str] | None = None) -> dict:
         "revoked": bool(row["revoked"]),
         "last_accessed": row["last_accessed"],
         "ip_allowlist": ip_list,
+        "proximity": {
+            "proximity_required": bool(row["proximity_required"]),
+            "geofence_radius_m": row["geofence_radius_m"],
+            "allow_home_network": bool(row["allow_home_network"]),
+        },
         "entity_count": count,
         "entity_ids": entity_ids,
     }
@@ -114,6 +195,8 @@ def _activity_row_to_response(row: Any) -> dict:
         "target_entity_id": row["entity_id"],
         "service": row["service"],
         "ip_address": row["ip_address"],
+        "proximity_method": row["proximity_method"],
+        "distance_m": row["distance_m"],
     }
 
 
@@ -169,6 +252,7 @@ async def create_token(
         entity_ids=body.entity_ids,
         expires_at=expires_at,
         ip_allowlist=body.ip_allowlist,
+        proximity=body.proximity.model_dump() if body.proximity else None,
     )
     entity_ids = await db.get_token_entities(row["id"])
     return _row_to_response(row, entity_ids)
@@ -202,6 +286,20 @@ async def update_token_entities(
     entity_ids = await db.get_token_entities(token_id)
     row = await db.get_token_by_id(token_id)
     return _row_to_response(row, entity_ids)
+
+
+@router.patch("/tokens/{token_id}/proximity")
+async def update_token_proximity(
+    token_id: str,
+    body: ProximitySettings,
+    _: str = Depends(require_admin),
+) -> dict:
+    row = await db.get_token_by_id(token_id)
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    await db.update_token_proximity(token_id, body.model_dump())
+    row = await db.get_token_by_id(token_id)
+    return _row_to_response(row, await db.get_token_entities(token_id))
 
 
 @router.patch("/tokens/{token_id}/expiry")
