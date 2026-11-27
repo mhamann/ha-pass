@@ -187,10 +187,10 @@
 {% endblock %}
 
 {% block body_scripts %}
-<script src="{{ base_path }}/static/util.js"></script>
-<script src="{{ base_path }}/static/domains.js"></script>
-<script src="{{ base_path }}/static/theme.js"></script>
-<script nonce="{{ csp_nonce }}">
+<script data-cfasync="false" src="{{ base_path }}/static/util.js"></script>
+<script data-cfasync="false" src="{{ base_path }}/static/domains.js"></script>
+<script data-cfasync="false" src="{{ base_path }}/static/theme.js"></script>
+<script data-cfasync="false" nonce="{{ csp_nonce }}">
 requestAnimationFrame(updateThemeToggles);
 
 const SLUG = {{ slug | tojson }};

@@ -15,3 +15,18 @@ async def test_health_check_returns_503_when_ws_unhealthy(client, mock_ha_client
     data = resp.json()
     assert data["status"] == "degraded"
     assert data["ws"] == "disconnected"
+
+
+async def test_html_opts_out_of_cdn_script_rewriting(client, sample_token):
+    """Cloudflare Rocket Loader rewrites <script> tags and re-runs inline ones
+    without their CSP nonce, which the browser then blocks (page never starts).
+    HTML must carry Cache-Control: no-transform and every script data-cfasync=false."""
+    import re
+
+    for path in (f"/g/{sample_token['slug']}", "/admin/dashboard", "/g/does-not-exist"):
+        resp = await client.get(path)
+        assert "no-transform" in resp.headers["cache-control"], path
+        tags = re.findall(r"<script\b[^>]*>", resp.text)
+        assert tags, path
+        for tag in tags:
+            assert 'data-cfasync="false"' in tag, (path, tag)
