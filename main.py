@@ -5,6 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,9 +45,17 @@ async def lifespan(app: FastAPI):
 
     try:
         await ha_client.validate_connectivity()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            # Misconfiguration (bad/revoked token) — fail fast so it's noticed.
+            logger.critical("Home Assistant rejected HA_TOKEN (HTTP %d)", exc.response.status_code)
+            raise RuntimeError("Home Assistant rejected HA_TOKEN") from exc
+        logger.warning("Home Assistant returned HTTP %d at startup; continuing, will retry", exc.response.status_code)
     except Exception as exc:
-        logger.error("Cannot reach Home Assistant: %s", exc)
-        raise RuntimeError("Home Assistant unreachable at startup") from exc
+        # Transient (e.g. HA still booting after a power cut). Keep serving:
+        # the WebSocket listener reconnects with backoff and /health reports
+        # degraded until it does. Guests see "unavailable" states meanwhile.
+        logger.warning("Home Assistant unreachable at startup (%s); continuing, will retry", exc)
 
     await ha_client.start_ws_listener()
 
@@ -105,6 +114,11 @@ async def security_headers(request: Request, call_next):
     if ingress_path:
         # Ingress loads inside HA iframe — allow framing from same origin
         frame_ancestors = "frame-ancestors 'self'"
+    elif settings.admin_frame_ancestors and (
+        request.url.path == "/" or request.url.path.startswith("/admin")
+    ):
+        # Admin may be embedded in an HA "Webpage" dashboard; only that origin.
+        frame_ancestors = f"frame-ancestors {settings.admin_frame_ancestors}"
     else:
         response.headers["X-Frame-Options"] = "DENY"
         frame_ancestors = "frame-ancestors 'none'"
@@ -142,6 +156,8 @@ async def admin_dashboard_page(request: Request):
         "never_expires": NEVER_EXPIRES_SECONDS,
         "is_ingress": bool(ctx["base_path"]),
         "guest_url": settings.guest_url,
+        "password_login_enabled": settings.password_login_enabled,
+        "ha_login_enabled": settings.ha_login_enabled,
     })
     return _templates.TemplateResponse(request, "admin_dashboard.html", ctx)
 

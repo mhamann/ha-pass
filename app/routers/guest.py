@@ -13,11 +13,13 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from app import database as db
 from app import ha_client
+from app import proximity
+from app.client_ip import client_ip, request_is_https
 from app.config import settings
 from app.context import base_context
 from app.models import (
@@ -25,6 +27,7 @@ from app.models import (
     CommandRequest,
     FORBIDDEN_DATA_KEYS,
     NEVER_EXPIRES_SECONDS,
+    PresenceRequest,
 )
 from app.rate_limiter import rate_limiter
 
@@ -37,6 +40,7 @@ SSE_KEEPALIVE_SECONDS = 25
 # Global rate limit for guest command proxy (requests per minute per token).
 # Hardcoded — no comparable self-hosted app exposes per-user rate limits.
 COMMAND_RPM = 30
+PRESENCE_RPM = 20
 
 # L-8: Whitelist of allowed SSE event types
 _ALLOWED_SSE_EVENTS = {"state_change", "token_expired", "reconnected"}
@@ -68,16 +72,8 @@ templates = Jinja2Templates(directory="templates")
 # ---------------------------------------------------------------------------
 
 def _client_ip(request: Request) -> str:
-    """Extract the client IP from X-Forwarded-For (set by reverse proxy).
-
-    IMPORTANT: HAPass MUST be deployed behind a reverse proxy (Caddy, nginx,
-    Cloudflare Tunnel, etc.) that overwrites the X-Forwarded-For header with the
-    true client IP. Without this, clients can spoof their IP to bypass allowlists.
-    """
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Client IP, honouring forwarding headers only from TRUSTED_PROXIES."""
+    return client_ip(request)
 
 
 def _enforce_ip_allowlist(row, request: Request) -> None:
@@ -108,11 +104,39 @@ async def _validate_token(slug: str, request: Request):
     return row
 
 
-async def _fire_activity_event(payload: dict) -> None:
+async def _enforce_view_proximity(row, request: Request) -> int | None:
+    """403 unless the viewer is on the home network or holds a presence grant."""
     try:
-        await ha_client.fire_event(ACTIVITY_EVENT_TYPE, payload)
-    except Exception as exc:
-        logger.warning("Failed to emit HA activity event: %s", exc)
+        return await proximity.check_view(
+            row,
+            _client_ip(request),
+            request.cookies.get(proximity.grant_cookie_name(row["slug"])),
+        )
+    except proximity.ProximityDenied as denied:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=denied.detail())
+
+
+# Firing events over REST needs an HA *admin* token. With a least-privilege
+# (non-admin) token we log once and stop trying; the logbook entry still works.
+_activity_events_forbidden = False
+
+
+async def _fire_activity_event(payload: dict) -> None:
+    global _activity_events_forbidden
+    if not _activity_events_forbidden:
+        try:
+            await ha_client.fire_event(ACTIVITY_EVENT_TYPE, payload)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                _activity_events_forbidden = True
+                logger.info(
+                    "HA token may not fire events (non-admin); %s events disabled, logbook still written",
+                    ACTIVITY_EVENT_TYPE,
+                )
+            else:
+                logger.warning("Failed to emit HA activity event: %s", exc)
+        except Exception as exc:
+            logger.warning("Failed to emit HA activity event: %s", exc)
     try:
         await ha_client.logbook_log(_logbook_payload(payload))
     except Exception as exc:
@@ -142,14 +166,20 @@ def _activity_payload(
     activity: str,
     target_entity_id: str | None = None,
     service: str | None = None,
+    proximity_method: str | None = None,
+    distance_m: int | None = None,
 ) -> dict:
-    return {
+    payload = {
         "schema_version": ACTIVITY_SCHEMA_VERSION,
         "activity": activity,
         "token_label": row["label"],
         "target_entity_id": target_entity_id,
         "service": service,
     }
+    if proximity_method is not None:
+        payload["proximity_method"] = proximity_method
+        payload["distance_m"] = distance_m
+    return payload
 
 
 def _schedule_activity_event(background_tasks: BackgroundTasks, payload: dict) -> None:
@@ -207,6 +237,8 @@ async def guest_pwa(background_tasks: BackgroundTasks, request: Request, slug: s
         "expires_at": row["expires_at"],
         "contact_message": settings.contact_message,
         "never_expires": NEVER_EXPIRES_SECONDS,
+        "proximity_required": bool(row["proximity_required"]),
+        "proximity_radius_m": row["geofence_radius_m"],
     })
     return templates.TemplateResponse(request, "guest_pwa.html", ctx)
 
@@ -249,6 +281,7 @@ async def guest_manifest(request: Request, slug: str = Path(max_length=64)):
 @router.get("/{slug}/state")
 async def guest_state(request: Request, slug: str = Path(max_length=64)):
     row = await _validate_token(slug, request)
+    await _enforce_view_proximity(row, request)
     entity_ids = await db.get_token_entities(row["id"])
 
     allowed = set(entity_ids)
@@ -262,14 +295,24 @@ async def guest_state(request: Request, slug: str = Path(max_length=64)):
         if eid not in states:
             states[eid] = {"entity_id": eid, "state": "unavailable", "attributes": {}}
 
-    return {"entities": entity_ids, "states": states}
+    return {
+        "entities": entity_ids,
+        "states": states,
+        "proximity": {
+            "required": bool(row["proximity_required"]),
+            "radius_m": row["geofence_radius_m"],
+            "allow_home_network": bool(row["allow_home_network"]),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
 # SSE stream
 # ---------------------------------------------------------------------------
 
-async def _event_generator(token_id: str, slug: str, request: Request) -> AsyncIterator[str]:
+async def _event_generator(
+    token_id: str, slug: str, request: Request, deadline: int | None = None,
+) -> AsyncIterator[str]:
     q = await ha_client.subscribe(token_id)
     try:
         # M-5: Expose WS health in SSE connected event
@@ -279,8 +322,17 @@ async def _event_generator(token_id: str, slug: str, request: Request) -> AsyncI
             if await request.is_disconnected():
                 break
 
+            timeout = SSE_KEEPALIVE_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    # Presence grant lapsed: the page re-checks, then reconnects.
+                    yield "event: proximity_expired\ndata: {}\n\n"
+                    break
+                timeout = min(timeout, remaining)
+
             try:
-                event = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECONDS)
+                event = await asyncio.wait_for(q.get(), timeout=timeout)
                 # L-8: Only forward whitelisted event types
                 if event["type"] not in _ALLOWED_SSE_EVENTS:
                     continue
@@ -297,14 +349,77 @@ async def _event_generator(token_id: str, slug: str, request: Request) -> AsyncI
 @router.get("/{slug}/stream")
 async def guest_stream(request: Request, slug: str = Path(max_length=64)):
     row = await _validate_token(slug, request)
+    deadline = await _enforce_view_proximity(row, request)
     return StreamingResponse(
-        _event_generator(row["id"], slug, request),
+        _event_generator(row["id"], slug, request, deadline),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Presence check (unlocks viewing on proximity-gated links)
+# ---------------------------------------------------------------------------
+
+@router.post("/{slug}/presence")
+async def guest_presence(
+    body: PresenceRequest,
+    request: Request,
+    response: Response,
+    slug: str = Path(max_length=64),
+):
+    row = await _validate_token(slug, request)
+    if not proximity.token_requires_proximity(row):
+        return {"ok": True, "required": False}
+
+    if not await rate_limiter.check(f"presence:{row['id']}", PRESENCE_RPM):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
+
+    ip = _client_ip(request)
+    location = proximity.parse_location(body.location)
+    try:
+        result = await proximity.check(row, ip, location)
+    except proximity.ProximityDenied as denied:
+        # "location_required" is the normal first step (no GPS sent yet) — not
+        # worth an audit row; real denials are.
+        if denied.reason != "location_required":
+            await db.log_access(
+                token_id=row["id"],
+                event_type="presence_denied",
+                ip_address=ip,
+                user_agent=request.headers.get("User-Agent"),
+                distance_m=denied.distance_m,
+            )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=denied.detail())
+
+    value, exp = proximity.issue_grant(row["id"], result.method)
+    response.set_cookie(
+        proximity.grant_cookie_name(slug),
+        value,
+        max_age=proximity.GRANT_TTL_S,
+        path=f"{request.state.ingress_path}/g/{slug}",
+        httponly=True,
+        samesite="strict",
+        secure=request_is_https(request),
+    )
+    await db.log_access(
+        token_id=row["id"],
+        event_type="presence",
+        ip_address=ip,
+        user_agent=request.headers.get("User-Agent"),
+        proximity_method=result.method,
+        distance_m=result.distance_m,
+    )
+    return {
+        "ok": True,
+        "required": True,
+        "method": result.method,
+        "distance_m": result.distance_m,
+        "expires_in": exp - int(time.time()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +473,21 @@ async def guest_command(
     clean_data = {k: v for k, v in body.data.items() if k not in FORBIDDEN_DATA_KEYS}
     service_data = {**clean_data, "entity_id": body.entity_id}
 
+    ip = _client_ip(request)
+    try:
+        prox = await proximity.check(row, ip, proximity.parse_location(body.location))
+    except proximity.ProximityDenied as denied:
+        await db.log_access(
+            token_id=token_id,
+            event_type="command_denied_proximity",
+            ip_address=ip,
+            user_agent=request.headers.get("User-Agent"),
+            entity_id=body.entity_id,
+            service=body.service,
+            distance_m=denied.distance_m,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=denied.detail())
+
     try:
         result = await ha_client.call_service(entity_domain, svc_name, service_data)
     except httpx.HTTPStatusError as exc:
@@ -368,10 +498,12 @@ async def guest_command(
     await db.log_access(
         token_id=token_id,
         event_type="command",
-        ip_address=_client_ip(request),
+        ip_address=ip,
         user_agent=request.headers.get("User-Agent"),
         entity_id=body.entity_id,
         service=body.service,
+        proximity_method=prox.method,
+        distance_m=prox.distance_m,
     )
     _schedule_activity_event(
         background_tasks,
@@ -380,6 +512,8 @@ async def guest_command(
             "command",
             target_entity_id=body.entity_id,
             service=f"{entity_domain}.{svc_name}",
+            proximity_method=prox.method,
+            distance_m=prox.distance_m,
         ),
     )
 

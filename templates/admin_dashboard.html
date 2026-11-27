@@ -53,6 +53,17 @@
     <h1 class="text-xl font-serif text-center mb-1">{{ app_name }}</h1>
     <p class="text-xs text-muted text-center mb-6 font-mono uppercase tracking-widest">Admin Access</p>
     <div class="space-y-4">
+      {% if ha_login_enabled %}
+      <a href="{{ base_path }}/admin/auth/ha/start" id="ha-login" class="w-full py-2.5 rounded-xl bg-primary hover:bg-primary-hover text-white font-display font-semibold text-sm transition-colors flex items-center justify-center gap-2">
+        <span aria-hidden="true" class="material-symbols-outlined text-base">home</span>
+        Sign in with Home Assistant
+      </a>
+      {% if not password_login_enabled %}
+      <div id="l-error" role="alert" class="text-primary text-xs min-h-[18px] text-center"></div>
+      {% endif %}
+      {% endif %}
+      {% if password_login_enabled %}
+      {% if ha_login_enabled %}<div class="text-center text-[10px] font-mono uppercase tracking-widest text-muted">or</div>{% endif %}
       <div>
         <label for="l-user" class="block text-xs font-mono uppercase tracking-wider text-muted mb-1.5">Username</label>
         <input id="l-user" type="text" required autocomplete="username"
@@ -67,6 +78,7 @@
       <button data-action="do-login" class="w-full py-2.5 rounded-xl bg-primary hover:bg-primary-hover text-white font-display font-semibold text-sm transition-colors">
         Sign in
       </button>
+      {% endif %}
     </div>
   </div>
 </div>
@@ -201,6 +213,26 @@
         <input id="f-ip" type="text" placeholder="192.168.1.0/24"
           class="w-full px-3 py-2.5 rounded-xl border border-border-light dark:border-border-dark bg-bg-light dark:bg-bg-dark text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
       </div>
+      <fieldset class="rounded-xl border border-border-light dark:border-border-dark p-3 space-y-2.5">
+        <label class="flex items-center gap-2 text-sm">
+          <input id="f-prox" type="checkbox" class="accent-primary">
+          <span aria-hidden="true" class="material-symbols-outlined text-base text-muted">location_on</span>
+          <span>Only works near home</span>
+        </label>
+        <div id="f-prox-opts" class="space-y-2.5 pl-6">
+          <label class="flex items-center gap-2 text-xs text-muted">
+            <span class="font-mono uppercase tracking-wider">Radius</span>
+            <input id="f-prox-radius" type="number" min="25" max="5000" step="25" value="150"
+              class="w-24 px-2 py-1.5 rounded-lg border border-border-light dark:border-border-dark bg-bg-light dark:bg-bg-dark text-sm outline-none focus:border-primary">
+            <span>meters from home (GPS)</span>
+          </label>
+          <label class="flex items-center gap-2 text-xs text-muted">
+            <input id="f-prox-net" type="checkbox" class="accent-primary" checked>
+            <span>Also allow anyone on the home network</span>
+          </label>
+          <p class="text-[11px] text-muted">Viewing and controls both require the check. GPS is reported by the guest's browser, so it stops casual misuse; expiry and revocation remain the real controls.</p>
+        </div>
+      </fieldset>
       <div>
         <label class="block text-xs font-mono uppercase tracking-wider text-muted mb-1.5">Entities</label>
         <div id="create-picker"></div>
@@ -224,6 +256,26 @@
       </button>
     </div>
     <div id="edit-token-label" class="text-sm text-muted mb-4"></div>
+      <fieldset class="mb-4 rounded-xl border border-border-light dark:border-border-dark p-3 space-y-2.5">
+        <label class="flex items-center gap-2 text-sm">
+          <input id="e-prox" type="checkbox" class="accent-primary">
+          <span aria-hidden="true" class="material-symbols-outlined text-base text-muted">location_on</span>
+          <span>Only works near home</span>
+        </label>
+        <div id="e-prox-opts" class="space-y-2.5 pl-6">
+          <label class="flex items-center gap-2 text-xs text-muted">
+            <span class="font-mono uppercase tracking-wider">Radius</span>
+            <input id="e-prox-radius" type="number" min="25" max="5000" step="25" value="150"
+              class="w-24 px-2 py-1.5 rounded-lg border border-border-light dark:border-border-dark bg-bg-light dark:bg-bg-dark text-sm outline-none focus:border-primary">
+            <span>meters from home (GPS)</span>
+          </label>
+          <label class="flex items-center gap-2 text-xs text-muted">
+            <input id="e-prox-net" type="checkbox" class="accent-primary" checked>
+            <span>Also allow anyone on the home network</span>
+          </label>
+          <p class="text-[11px] text-muted">Viewing and controls both require the check. GPS is reported by the guest's browser, so it stops casual misuse; expiry and revocation remain the real controls.</p>
+        </div>
+      </fieldset>
     <div id="edit-picker"></div>
     <div id="edit-error" role="alert" class="text-primary text-xs min-h-[18px] mt-2"></div>
     <div class="flex justify-end gap-2 mt-5 pt-4 border-t border-border-light dark:border-border-dark">
@@ -342,7 +394,31 @@ async function checkAuth() {
   showLogin();
 }
 
+const HA_LOGIN = {{ ha_login_enabled | tojson }};
+let justLoggedOut = false;
+const PASSWORD_LOGIN = {{ password_login_enabled | tojson }};
+const LOGIN_ERRORS = {
+  not_admin: 'That Home Assistant user is not an administrator.',
+  not_allowed: 'That Home Assistant user is not allowed to manage guest links.',
+  cancelled: 'Sign-in was cancelled.',
+  bad_state: 'Sign-in expired or was tampered with — please try again.',
+  code_rejected: 'Home Assistant rejected the sign-in — please try again.',
+  ha_error: 'Could not reach Home Assistant.',
+  rate_limited: 'Too many sign-in attempts — wait a minute.',
+};
+
 function showLogin() {
+  const params = new URLSearchParams(location.search);
+  const loginError = params.get('login_error');
+  if (loginError) {
+    history.replaceState(null, '', location.pathname);
+    const el = document.getElementById('l-error');
+    if (el) el.textContent = LOGIN_ERRORS[loginError] || 'Sign-in failed.';
+  } else if (HA_LOGIN && !PASSWORD_LOGIN && !justLoggedOut) {
+    // HA is the only way in: go straight there.
+    location.href = document.getElementById('ha-login').href;
+    return;
+  }
   document.body.classList.remove('loading');
   document.getElementById('login-screen').classList.remove('hidden');
   document.getElementById('login-screen').classList.add('flex');
@@ -368,6 +444,7 @@ async function doLogin() {
 
 async function doLogout() {
   await fetch(`${BASE}/admin/logout`, {method: 'POST'});
+  justLoggedOut = true;
   stopAutoRefresh();
   document.getElementById('app').classList.add('hidden');
   showLogin();
@@ -385,8 +462,8 @@ function showApp() {
   requestAnimationFrame(updateThemeToggles);
 }
 
-document.getElementById('l-user').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('l-pass').focus(); });
-document.getElementById('l-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+document.getElementById('l-user')?.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('l-pass').focus(); });
+document.getElementById('l-pass')?.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
 // ── Token List ────────────────────────────────────────────────────────
 async function loadTokens() {
@@ -424,14 +501,22 @@ function renderActivity() {
   const visibleActivity = activityExpanded ? activity : activity.slice(0, ACTIVITY_COLLAPSED_COUNT);
   list.innerHTML = visibleActivity.map(a => {
     const isCommand = a.activity === 'command';
-    const icon = isCommand ? 'touch_app' : 'link';
+    const isDenied = a.activity === 'command_denied_proximity' || a.activity === 'presence_denied';
+    const isPresence = a.activity === 'presence';
+    const icon = isDenied ? 'location_off' : isPresence ? 'location_on' : isCommand ? 'touch_app' : 'link';
     const tokenLabel = a.token_label || 'Deleted token';
+    const where = a.proximity_method === 'network' ? 'on home network'
+      : (a.distance_m != null ? `${a.distance_m} m from home` : '');
     const title = isCommand
       ? `${esc(tokenLabel)} used ${esc(a.service || 'command')}`
+      : isDenied ? `${esc(tokenLabel)} blocked — not near home`
+      : isPresence ? `${esc(tokenLabel)} verified near home`
       : `${esc(tokenLabel)} opened link`;
-    const detail = isCommand && a.target_entity_id
-      ? esc(a.target_entity_id)
-      : (a.ip_address ? esc(a.ip_address) : 'Guest page');
+    const parts = [];
+    if ((isCommand || a.activity === 'command_denied_proximity') && a.target_entity_id) parts.push(a.target_entity_id);
+    if (where) parts.push(where);
+    if (!parts.length && a.ip_address) parts.push(a.ip_address);
+    const detail = parts.length ? esc(parts.join(' · ')) : 'Guest page';
     return `<li class="bg-surface-light dark:bg-surface-dark border border-border-light dark:border-border-dark rounded-xl px-4 py-3 shadow-card">
       <div class="flex items-center gap-3">
         <div class="w-8 h-8 rounded-full ${isCommand ? 'bg-accent/15 text-accent' : 'bg-ink/10 text-ink'} flex items-center justify-center flex-shrink-0">
@@ -588,6 +673,12 @@ function renderTokens() {
             <span aria-hidden="true" class="material-symbols-outlined text-base">lan</span>
             <span>${t.ip_allowlist ? esc(t.ip_allowlist.join(', ')) : 'Any IP'}</span>
           </div>
+          <div class="flex items-center gap-2 text-muted">
+            <span aria-hidden="true" class="material-symbols-outlined text-base">${t.proximity && t.proximity.proximity_required ? 'location_on' : 'public'}</span>
+            <span>${t.proximity && t.proximity.proximity_required
+              ? `Near home · ${esc(String(t.proximity.geofence_radius_m))} m${t.proximity.allow_home_network ? ' or home Wi-Fi' : ''}`
+              : 'Works anywhere'}</span>
+          </div>
         </div>
 
         <div class="grid grid-cols-3 gap-2">
@@ -728,12 +819,39 @@ function pickerRemove(containerId, entityId) {
 }
 
 // ── Create Token Modal ────────────────────────────────────────────────
+// ── Proximity form helpers ───────────────────────────────────────────
+function setProximityFields(prefix, p) {
+  p = p || {};
+  document.getElementById(`${prefix}-prox`).checked = !!p.proximity_required;
+  document.getElementById(`${prefix}-prox-radius`).value = p.geofence_radius_m || 150;
+  document.getElementById(`${prefix}-prox-net`).checked = p.allow_home_network !== false;
+  syncProximityFields(prefix);
+}
+function syncProximityFields(prefix) {
+  const on = document.getElementById(`${prefix}-prox`).checked;
+  document.getElementById(`${prefix}-prox-opts`).classList.toggle('opacity-50', !on);
+  document.querySelectorAll(`#${prefix}-prox-opts input`).forEach(i => { i.disabled = !on; });
+}
+function getProximityFields(prefix) {
+  const radius = parseInt(document.getElementById(`${prefix}-prox-radius`).value, 10);
+  if (!(radius >= 25 && radius <= 5000)) return null;
+  return {
+    proximity_required: document.getElementById(`${prefix}-prox`).checked,
+    geofence_radius_m: radius,
+    allow_home_network: document.getElementById(`${prefix}-prox-net`).checked,
+  };
+}
+['f', 'e'].forEach(prefix => {
+  document.getElementById(`${prefix}-prox`).addEventListener('change', () => syncProximityFields(prefix));
+});
+
 function openCreateModal(preset = {}) {
   createPicker = { selected: new Set(preset.entityIds || []), filter: 'all', search: '' };
   document.getElementById('create-modal-title').textContent = preset.title || 'Create Guest Token';
   document.getElementById('f-label').value = preset.label || '';
   document.getElementById('f-slug').value = '';
   document.getElementById('f-ip').value = (preset.ipAllowlist || []).join(', ');
+  setProximityFields('f', preset.proximity || { proximity_required: true });
   document.getElementById('f-expiry').value = preset.expiryValue || '86400';
   document.getElementById('create-error').textContent = '';
   document.getElementById('f-custom-expiry').classList.add('hidden');
@@ -757,12 +875,15 @@ async function submitCreate() {
   if (!label) { errEl.textContent = 'Label is required.'; return; }
   if (expiresIn === null) { errEl.textContent = 'Invalid expiry date. Must be in the future.'; return; }
   if (createPicker.selected.size === 0) { errEl.textContent = 'Select at least one entity.'; return; }
+  const proximity = getProximityFields('f');
+  if (!proximity) { errEl.textContent = 'Radius must be between 25 and 5000 meters.'; return; }
 
   const body = {
     label, slug,
     entity_ids: [...createPicker.selected],
     expires_in_seconds: expiresIn,
     ip_allowlist: ipList,
+    proximity,
   };
 
     const r = await fetch(`${BASE}/admin/tokens`, {
@@ -794,6 +915,7 @@ async function duplicateToken(tokenId) {
     label: `${token.label} copy`,
     entityIds: token.entity_ids || [],
     ipAllowlist: token.ip_allowlist || [],
+    proximity: token.proximity,
     expiryValue: token.expires_at === NEVER_EXPIRES ? String(NEVER_EXPIRES) : '86400',
   });
 }
@@ -811,6 +933,7 @@ async function openEditModal(tokenId) {
   if (!r.ok) { showToast('Failed to load token', 'error'); closeEditModal(); return; }
   const token = await r.json();
   document.getElementById('edit-token-label').textContent = `Editing: ${token.label}`;
+  setProximityFields('e', token.proximity);
   if (token.entity_ids) {
     token.entity_ids.forEach(id => editPicker.selected.add(id));
   }
@@ -822,6 +945,19 @@ async function submitEditEntities() {
   if (!editTokenId) return;
   const errEl = document.getElementById('edit-error');
   if (editPicker.selected.size === 0) { errEl.textContent = 'Select at least one entity.'; return; }
+  const proximity = getProximityFields('e');
+  if (!proximity) { errEl.textContent = 'Radius must be between 25 and 5000 meters.'; return; }
+
+  const pr = await fetch(`${BASE}/admin/tokens/${editTokenId}/proximity`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(proximity),
+  });
+  if (!pr.ok) {
+    const err = await pr.json().catch(() => ({}));
+    errEl.textContent = (typeof err.detail === 'string' && err.detail) || 'Error updating proximity.';
+    return;
+  }
 
   const r = await fetch(`${BASE}/admin/tokens/${editTokenId}/entities`, {
     method: 'PATCH',

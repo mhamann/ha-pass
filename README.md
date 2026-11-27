@@ -30,6 +30,8 @@ installs, just a link.
 - **Service allowlist** — only safe services (toggle, set_temperature, etc.) are permitted
 - **Rate limiting** — 30 req/min per token
 - **IP allowlisting** — optionally restrict tokens to specific CIDRs
+- **Near-home only** — optionally require guests to be at the house (home network or GPS geofence) to view or control anything — see [Proximity](#proximity-near-home-links)
+- **Sign in with Home Assistant** — optional OAuth login for the admin dashboard (HA admins only, MFA respected) — see [Admin sign-in](#admin-sign-in-with-home-assistant)
 
 ## Installation
 
@@ -120,6 +122,22 @@ Set these in **Settings → Add-ons → HAPass → Configuration**:
 | `BRAND_BG` | Background color (hex) | No | `#F2F0E9` |
 | `BRAND_PRIMARY` | Primary/accent color (hex) | No | `#D9523C` |
 | `GUEST_URL` | External base URL for guest links | No | — |
+| `HOST` | Interface uvicorn binds to | No | `0.0.0.0` |
+| `TRUSTED_PROXIES` | IPs/CIDRs of reverse proxies whose forwarding header is trusted (comma-separated). Empty = never trust forwarding headers | No | — |
+| `CLIENT_IP_HEADER` | Header carrying the client IP from a trusted proxy. `X-Forwarded-For` is walked right-to-left; use `CF-Connecting-IP` behind Cloudflare Tunnel | No | `X-Forwarded-For` |
+| `HOME_PUBLIC_IPS` | Static public IPs/CIDRs that count as "on the home network" | No | — |
+| `HOME_WAN_IP_ENTITY` | HA entity whose state is the home's public IP (e.g. a router external-IP sensor) | No | — |
+| `HOME_LATITUDE` / `HOME_LONGITUDE` | Override the home location used for GPS checks | No | HA's location |
+| `ADMIN_AUTH` | `password`, `ha` (Sign in with Home Assistant only) or `both` | No | `password` |
+| `HA_EXTERNAL_URL` | Browser-facing HA URL for the sign-in redirect | With `ha` | — |
+| `PUBLIC_URL` | This app's public base URL (OAuth client ID) | No | `GUEST_URL` |
+| `ADMIN_HA_USER_IDS` | Restrict admin sign-in to these HA user IDs (comma-separated) | No | any HA admin |
+| `ADMIN_FRAME_ANCESTORS` | Origin allowed to embed the admin dashboard (e.g. an HA Webpage dashboard) | No | — |
+
+> **Client IPs behind a proxy.** Forwarding headers are honoured only when the
+> TCP peer is in `TRUSTED_PROXIES`. Without it, IP allowlists and the
+> home-network check use the socket address. Upstream HAPass ≤ 0.2.4 trusted
+> the *first* `X-Forwarded-For` entry, which a client can set freely.
 
 ## Home Assistant Activity Events
 
@@ -162,6 +180,37 @@ actions:
         {{ trigger.event.data.service }}
         on {{ trigger.event.data.target_entity_id }}
 ```
+
+## Proximity (near-home links)
+
+Tick **Only works near home** when creating a link. The link then requires,
+for **viewing** (state + live stream) and for **every command**, one of:
+
+- **Home network** — the guest's IP is the home's public IP
+  (`HOME_PUBLIC_IPS` and/or `HOME_WAN_IP_ENTITY`). Through a tunnel, devices on
+  home Wi-Fi arrive with the WAN IP. Server-observed; can't be forged.
+- **GPS** — the browser shares a fix within the link's radius (25–5000 m) of
+  home. The fix must be ≤ 60 s old and accurate to ≤ 200 m.
+
+Viewing is unlocked by `POST /g/{slug}/presence`, which sets a 10-minute
+HttpOnly cookie scoped to that one link; the page renews it silently and the
+live stream closes when it lapses. Commands need a fresh fix each time (or the
+home network) — a view grant alone can't operate anything.
+
+Every check is audited (method, distance; denials too) in the activity feed.
+
+**Limits:** browser GPS is reported by the client, so a determined link-holder
+could fake it. Proximity stops casual and remote misuse; short expiry and
+revocation remain the real controls.
+
+## Admin sign-in with Home Assistant
+
+With `ADMIN_AUTH=ha`, the dashboard sends you to your HA login page (OAuth2
+authorization code + PKCE; HA needs no client registration because the client
+ID is `PUBLIC_URL`). Only HA **administrators** are admitted (optionally only
+`ADMIN_HA_USER_IDS`). The HA refresh token is revoked immediately after
+sign-in, so HAPass never keeps HA credentials; it issues its own 12-hour admin
+session instead. `ADMIN_USERNAME`/`ADMIN_PASSWORD` aren't needed.
 
 ## Supported Entity Types
 

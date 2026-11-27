@@ -183,6 +183,26 @@ async def get_states() -> list[dict]:
     return await _retry_http(_do)
 
 
+async def get_state(entity_id: str) -> dict | None:
+    """Return one entity's state object, or None if HA reports 404."""
+    async def _do():
+        resp = await _require_client().get(f"/api/states/{entity_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    return await _retry_http(_do)
+
+
+async def get_config() -> dict:
+    """Return HA core config (/api/config): location, units, URLs."""
+    async def _do():
+        resp = await _require_client().get("/api/config")
+        resp.raise_for_status()
+        return resp.json()
+    return await _retry_http(_do)
+
+
 async def call_service(domain: str, service: str, data: dict) -> Any:
     async def _do():
         resp = await _require_client().post(f"/api/services/{domain}/{service}", json=data)

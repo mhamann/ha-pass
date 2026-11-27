@@ -31,12 +31,19 @@ class AdminLoginRequest(BaseModel):
     password: str
 
 
+class ProximitySettings(BaseModel):
+    proximity_required: bool = False
+    geofence_radius_m: int = Field(default=150, ge=25, le=5000)
+    allow_home_network: bool = True
+
+
 class TokenCreateRequest(BaseModel):
     label: str = Field(..., min_length=1, max_length=200)
     slug: str | None = Field(default=None, pattern=r"^[a-z0-9_-]{1,64}$")
     entity_ids: list[str] = Field(..., min_length=1)
     expires_in_seconds: int = Field(..., gt=0)
     ip_allowlist: list[str] | None = None
+    proximity: ProximitySettings | None = None
 
 
 class TokenUpdateEntitiesRequest(BaseModel):
@@ -47,10 +54,23 @@ class TokenUpdateExpiryRequest(BaseModel):
     expires_in_seconds: int = Field(..., gt=0)
 
 
+class GuestLocation(BaseModel):
+    """Browser GeolocationPosition, sent with commands on proximity-gated links."""
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    accuracy: float = Field(..., ge=0, allow_inf_nan=False)
+    ts: int  # GeolocationPosition.timestamp, epoch milliseconds
+
+
+class PresenceRequest(BaseModel):
+    location: GuestLocation | None = None
+
+
 class CommandRequest(BaseModel):
     entity_id: str
     service: str  # e.g. "light.turn_on"
     data: dict[str, Any] = Field(default_factory=dict)
+    location: GuestLocation | None = None
 
 
 class TokenResponse(BaseModel):
@@ -62,5 +82,6 @@ class TokenResponse(BaseModel):
     revoked: bool
     last_accessed: int | None
     ip_allowlist: list[str] | None
+    proximity: ProximitySettings
     entity_count: int
     entity_ids: list[str] | None = None

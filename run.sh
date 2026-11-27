@@ -30,4 +30,4 @@ else
     echo "[run.sh] Standalone mode — using environment variables"
 fi
 
-exec python -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-5880}" --workers 1
+exec python -m uvicorn main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-5880}" --workers 1 --no-proxy-headers

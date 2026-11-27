@@ -40,7 +40,22 @@ jobs:
           git commit -m "Bump add-on version to ${GITHUB_REF_NAME#v}"
           git push
 
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
