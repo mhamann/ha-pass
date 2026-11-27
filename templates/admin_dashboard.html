@@ -361,10 +361,10 @@
 {% endblock %}
 
 {% block body_scripts %}
-<script src="{{ base_path }}/static/util.js"></script>
-<script src="{{ base_path }}/static/domains.js"></script>
-<script src="{{ base_path }}/static/theme.js"></script>
-<script nonce="{{ csp_nonce }}">
+<script data-cfasync="false" src="{{ base_path }}/static/util.js"></script>
+<script data-cfasync="false" src="{{ base_path }}/static/domains.js"></script>
+<script data-cfasync="false" src="{{ base_path }}/static/theme.js"></script>
+<script data-cfasync="false" nonce="{{ csp_nonce }}">
 const BASE = '{{ base_path }}';
 const IS_INGRESS = {{ 'true' if is_ingress else 'false' }};
 const GUEST_URL = '{{ guest_url }}';
@@ -1334,5 +1334,5 @@ document.addEventListener('input', e => {
 if (IS_INGRESS) { showApp(); } else { checkAuth(); }
 </script>
 <!-- QR code generator v1.4.4 | MIT | (c) Kazuhiko Arase -->
-<script src="{{ base_path }}/static/qrcode.min.js"></script>
+<script data-cfasync="false" src="{{ base_path }}/static/qrcode.min.js"></script>
 {% endblock %}

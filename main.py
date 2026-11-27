@@ -132,10 +132,12 @@ async def security_headers(request: Request, call_next):
         f"{frame_ancestors}"
     )
     response.headers["Content-Security-Policy"] = csp
-    # Prevent browser from caching HTML responses (avoids stale JS after deploys)
+    # Prevent browser from caching HTML responses (avoids stale JS after deploys).
+    # no-transform: stop CDN rewriting (e.g. Cloudflare Rocket Loader re-injects
+    # inline scripts without their CSP nonce, so the browser blocks them).
     content_type = response.headers.get("content-type", "")
     if "text/html" in content_type:
-        response.headers["Cache-Control"] = "no-store"
+        response.headers["Cache-Control"] = "no-store, no-transform"
     return response
 
 
